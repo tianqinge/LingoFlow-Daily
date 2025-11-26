@@ -1,0 +1,7 @@
+{
+  "name": "LingoFlow Daily",
+  "description": "A personalized daily English news reader with AI-powered proficiency adaptation, audio narration, and vocabulary context building.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
