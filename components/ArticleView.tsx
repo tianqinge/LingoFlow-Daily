@@ -23,6 +23,9 @@ const formatTime = (seconds: number) => {
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 };
 
+// Define the available tools for a segment
+type SegmentTool = 'translation' | 'analysis' | 'recording' | null;
+
 export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, onCheckIn, hasCheckedIn, onUpdateStatus, showToast }) => {
   const getModeFromStatus = (status: ArticleStatus) => {
       if (status === 'dictation') return 'dictation';
@@ -31,6 +34,7 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
   };
 
   const [mode, setMode] = useState<'read' | 'dictation' | 'recitation'>(getModeFromStatus(article.status || 'reading'));
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
      setMode(getModeFromStatus(article.status || 'reading'));
@@ -57,7 +61,9 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
   const segmentRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   const [recitationMode, setRecitationMode] = useState(false); 
-  const [visibleTranslations, setVisibleTranslations] = useState<Record<number, boolean>>({});
+  
+  // --- New Mutually Exclusive Tool State ---
+  const [activeSegmentTools, setActiveSegmentTools] = useState<Record<number, SegmentTool>>({});
   
   const [analyses, setAnalyses] = useState<Record<number, string | object>>({});
   const [isAnalyzing, setIsAnalyzing] = useState<Record<number, boolean>>({});
@@ -78,6 +84,29 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
     data?: { definition: string, phonetic: string };
   } | null>(null);
 
+  // Stop audio when switching modes (e.g. Read -> Dictation)
+  useEffect(() => {
+    if (mode !== 'read') {
+        stopAudio();
+    }
+  }, [mode]);
+
+  // Cleanup audio on component unmount
+  useEffect(() => {
+      isMountedRef.current = true;
+      return () => {
+          isMountedRef.current = false;
+          stopAudio();
+          if (audioContextRef.current) {
+              audioContextRef.current.close();
+              audioContextRef.current = null;
+          }
+          if (animationFrameRef.current) {
+              cancelAnimationFrame(animationFrameRef.current);
+          }
+      };
+  }, []);
+
   useEffect(() => {
     stopAudio();
     setAudioBuffer(null);
@@ -89,13 +118,16 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
     setTotalDuration(0);
     setActiveSegmentIndex(null);
     setRecitationMode(false);
-    setVisibleTranslations({});
+    
+    // Reset tools
+    setActiveSegmentTools({});
     setAnalyses({});
     setIsAnalyzing({});
     setSegmentRecordings({});
     setEvaluations({});
     setIsEvaluating({});
     setRecordingSegmentIndex(null);
+    
     segmentTimingsRef.current = [];
   }, [article.id]);
 
@@ -187,17 +219,25 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
       }
       
       const buffer = await generateSpeech(textToRead);
+      
+      // CRITICAL CHECK: Ensure we are still mounted and in 'read' mode before playing
+      if (!isMountedRef.current || mode !== 'read') {
+          return;
+      }
+
       setAudioBuffer(buffer);
       playBuffer(buffer);
     } catch (e) {
       console.error("Error generating speech", e);
-      showToast("Failed to generate narration.", "error");
+      if (isMountedRef.current) showToast("Failed to generate narration.", "error");
     } finally {
-      setIsLoadingAudio(false);
+      if (isMountedRef.current) setIsLoadingAudio(false);
     }
   };
 
   const playBuffer = (buffer: AudioBuffer, offset: number = 0) => {
+    if (!isMountedRef.current || mode !== 'read') return;
+
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
@@ -291,7 +331,7 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
       }
   };
 
-  const handleSegmentDoubleClick = (index: number) => {
+  const handlePlaySegment = (index: number) => {
      if (!audioBuffer) {
          fetchAndPlayAudio(); 
          return;
@@ -307,10 +347,41 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
      }
   };
 
-  const toggleSegmentRecording = async (index: number) => {
-    if (recordingSegmentIndex !== null && recordingSegmentIndex !== index) stopRecording();
-    if (recordingSegmentIndex === index) stopRecording();
-    else await startRecording(index);
+  // --- Accordion / Exclusive Tool Logic ---
+
+  const toggleTool = async (index: number, tool: SegmentTool, text: string) => {
+      // If checking the already active tool, toggle it off
+      if (activeSegmentTools[index] === tool) {
+          setActiveSegmentTools(prev => ({ ...prev, [index]: null }));
+          if (tool === 'recording') {
+              stopRecording();
+          }
+          return;
+      }
+
+      // Activate the new tool (this implicitly closes others for this segment)
+      setActiveSegmentTools(prev => ({ ...prev, [index]: tool }));
+
+      // Side Effects
+      if (tool !== 'recording' && recordingSegmentIndex === index) {
+          // If we were recording and switched to translation/insight, stop recording
+          stopRecording();
+      }
+
+      if (tool === 'analysis' && !analyses[index]) {
+          // Lazy load analysis
+          setIsAnalyzing(prev => ({ ...prev, [index]: true }));
+          try {
+              const jsonStr = await analyzeSegment(text);
+              const result = JSON.parse(jsonStr);
+              setAnalyses(prev => ({ ...prev, [index]: result }));
+          } catch (e) {
+              console.error("Analysis failed", e);
+              showToast("Could not analyze text.", "error");
+          } finally {
+              setIsAnalyzing(prev => ({ ...prev, [index]: false }));
+          }
+      }
   };
 
   const startRecording = async (index: number) => {
@@ -321,6 +392,7 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
         recorder = new MediaRecorder(stream);
       } catch (e) {
          if (MediaRecorder.isTypeSupported('audio/webm')) recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+         else if (MediaRecorder.isTypeSupported('audio/mp4')) recorder = new MediaRecorder(stream, { mimeType: 'audio/mp4' });
          else recorder = new MediaRecorder(stream);
       }
 
@@ -420,28 +492,6 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
       onAddWord(selectionMenu.word, selectionMenu.context);
       setSelectionMenu(null);
       window.getSelection()?.removeAllRanges();
-    }
-  };
-
-  const toggleTranslation = (index: number) => {
-    setVisibleTranslations(prev => ({ ...prev, [index]: !prev[index] }));
-  };
-
-  const toggleAnalysis = async (index: number, text: string) => {
-    if (analyses[index]) {
-      setAnalyses(prev => { const next = { ...prev }; delete next[index]; return next; });
-      return;
-    }
-    setIsAnalyzing(prev => ({ ...prev, [index]: true }));
-    try {
-      const jsonStr = await analyzeSegment(text);
-      const result = JSON.parse(jsonStr);
-      setAnalyses(prev => ({ ...prev, [index]: result }));
-    } catch (e) {
-      console.error("Analysis failed", e);
-      showToast("Could not analyze text.", "error");
-    } finally {
-      setIsAnalyzing(prev => ({ ...prev, [index]: false }));
     }
   };
 
@@ -574,68 +624,92 @@ export const ArticleView: React.FC<ArticleViewProps> = ({ article, onAddWord, on
             <div className="space-y-6 pb-20">
               {article.content.map((segment: ArticleSegment, idx: number) => {
                 const isActive = activeSegmentIndex === idx;
-                
+                const activeTool = activeSegmentTools[idx];
+
                 return (
-                  <div key={idx} ref={(el) => { if(el) segmentRefs.current.set(idx, el); }} onDoubleClick={() => handleSegmentDoubleClick(idx)}
-                    className={`relative p-4 md:px-6 -mx-4 md:-mx-6 rounded-2xl transition-all duration-500 cursor-text select-text border border-transparent ${isActive ? 'bg-stone-50/80 border-l-4 border-l-primary shadow-sm' : 'hover:bg-stone-50/50'}`}
+                  // Group class added here to enable hover effects on children
+                  <div key={idx} ref={(el) => { if(el) segmentRefs.current.set(idx, el); }} 
+                    className={`group relative p-4 md:px-6 -mx-4 md:-mx-6 rounded-2xl transition-all duration-500 cursor-text select-text border border-transparent ${isActive ? 'bg-stone-50/80 border-l-4 border-l-primary shadow-sm' : 'hover:bg-stone-50/50'}`}
                   >
                     <p className={`transition-all duration-500 ${recitationMode ? 'blur-md select-none opacity-40 hover:blur-none hover:opacity-100 cursor-pointer' : ''} ${isActive && !recitationMode ? 'text-stone-900 font-medium' : ''}`}>
                       {segment.en}
                     </p>
                     
-                    {/* Floating Tools */}
-                    <div className={`flex items-center gap-2 mt-3 transition-opacity duration-300 ${visibleTranslations[idx] || analyses[idx] || isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
-                       <button onClick={() => toggleTranslation(idx)} className={`h-7 px-2.5 rounded-lg text-[10px] font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all active:scale-95 ${visibleTranslations[idx] ? 'bg-primary text-white shadow-sm' : 'bg-white border border-stone-200 text-stone-500 hover:border-primary/30'}`}>
-                         <Languages size={12} /> {visibleTranslations[idx] ? 'Hide' : 'Translate'}
+                    {/* Floating Tools Trigger Bar - Appears on Hover or when Active */}
+                    <div className={`flex items-center gap-2 mt-3 transition-opacity duration-300 ${activeTool || isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+                       {/* New Play Button */}
+                       <button onClick={() => handlePlaySegment(idx)} className="h-7 px-2.5 rounded-lg text-[10px] font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all active:scale-95 bg-white border border-stone-200 text-stone-500 hover:border-primary/30">
+                          <Play size={12} fill="currentColor"/> Play
                        </button>
-                       <button onClick={() => toggleAnalysis(idx, segment.en)} disabled={isAnalyzing[idx]} className={`h-7 px-2.5 rounded-lg text-[10px] font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all active:scale-95 ${analyses[idx] ? 'bg-violet-100 text-violet-700 border border-violet-200' : 'bg-white border border-stone-200 text-stone-500 hover:border-primary/30'}`}>
-                         {isAnalyzing[idx] ? <Loader2 size={12} className="animate-spin"/> : <Sparkles size={12} />} {analyses[idx] ? 'Done' : 'Insight'}
+
+                       <button onClick={() => toggleTool(idx, 'translation', segment.en)} className={`h-7 px-2.5 rounded-lg text-[10px] font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all active:scale-95 ${activeTool === 'translation' ? 'bg-primary text-white shadow-sm' : 'bg-white border border-stone-200 text-stone-500 hover:border-primary/30'}`}>
+                         <Languages size={12} /> Translate
                        </button>
-                       <button onClick={() => toggleSegmentRecording(idx)} className={`h-7 px-2.5 rounded-lg text-[10px] font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all active:scale-95 ${recordingSegmentIndex === idx ? 'bg-accent text-white animate-pulse' : 'bg-white border border-stone-200 text-stone-500 hover:border-primary/30'}`}>
-                          {recordingSegmentIndex === idx ? <Square size={12} fill="currentColor"/> : <Mic size={12}/>}
+                       <button onClick={() => toggleTool(idx, 'analysis', segment.en)} disabled={isAnalyzing[idx]} className={`h-7 px-2.5 rounded-lg text-[10px] font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all active:scale-95 ${activeTool === 'analysis' ? 'bg-violet-100 text-violet-700 border border-violet-200' : 'bg-white border border-stone-200 text-stone-500 hover:border-primary/30'}`}>
+                         {isAnalyzing[idx] ? <Loader2 size={12} className="animate-spin"/> : <Sparkles size={12} />} Insight
+                       </button>
+                       <button onClick={() => toggleTool(idx, 'recording', segment.en)} className={`h-7 px-2.5 rounded-lg text-[10px] font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all active:scale-95 ${activeTool === 'recording' ? 'bg-accent text-white' : 'bg-white border border-stone-200 text-stone-500 hover:border-primary/30'}`}>
+                          <Mic size={12}/> Record
                        </button>
                     </div>
 
-                    {segmentRecordings[idx] && recordingSegmentIndex !== idx && (
-                       <div className="mt-3 flex flex-col gap-2 animate-fade-in bg-white border border-stone-100 p-2 rounded-xl shadow-sm w-full md:w-3/4">
-                          <div className="flex items-center gap-2">
-                              <div className="w-6 h-6 rounded-full bg-accent/10 flex items-center justify-center text-accent font-bold text-[8px]">ME</div>
-                              <audio controls src={segmentRecordings[idx].url} className="h-6 flex-1" />
-                              <button onClick={() => setSegmentRecordings(prev => { const n = {...prev}; delete n[idx]; return n; })} className="text-stone-400 hover:text-accent p-0.5"><X size={14} /></button>
-                          </div>
-                          {!evaluations[idx] && (
-                              <button onClick={() => handleEvaluateSegment(idx, segment.en)} disabled={isEvaluating[idx]} className="w-full py-1.5 bg-stone-50 hover:bg-primary/5 text-stone-600 hover:text-primary text-xs font-bold rounded-lg border border-stone-200 hover:border-primary/20 transition-all flex items-center justify-center gap-1">
-                                {isEvaluating[idx] ? <Loader2 size={12} className="animate-spin"/> : <Stethoscope size={12} />} Analyze Pronunciation
-                              </button>
-                          )}
-                          {evaluations[idx] && (
-                              <div className="bg-stone-50 rounded-lg p-3 text-sm">
-                                  <div className="flex items-center justify-between mb-2">
-                                      <span className={`text-xs font-bold uppercase ${evaluations[idx].score >= 80 ? 'text-emerald-600' : 'text-orange-500'}`}>Score: {evaluations[idx].score}</span>
-                                      <button onClick={() => setEvaluations(prev => { const n = {...prev}; delete n[idx]; return n; })} className="text-[10px] text-stone-400 underline">Clear</button>
-                                  </div>
-                                  <div className="font-serif leading-relaxed mb-2 text-stone-700" dangerouslySetInnerHTML={{ __html: evaluations[idx].diffHtml }} />
-                                  <div className="flex items-start gap-1.5 text-xs text-stone-500 bg-white p-2 rounded border border-stone-100">
-                                      <AlertCircle size={12} className="mt-0.5 flex-shrink-0 text-primary" /> {evaluations[idx].feedback}
-                                  </div>
-                              </div>
-                          )}
-                       </div>
-                    )}
-
-                    {visibleTranslations[idx] && (
+                    {/* MUTUALLY EXCLUSIVE CONTENT PANELS */}
+                    
+                    {/* 1. Translation Panel */}
+                    {activeTool === 'translation' && (
                       <div className="mt-3 text-base text-stone-600 font-sans leading-relaxed pl-4 border-l-2 border-primary/30 animate-fade-in bg-stone-50/50 p-3 rounded-r-lg">
                         {segment.zh}
                       </div>
                     )}
-                    
-                    {analyses[idx] && (
+
+                    {/* 2. Analysis Panel */}
+                    {activeTool === 'analysis' && (
                        <div className="mt-3 p-4 bg-white rounded-xl border border-violet-100 shadow-soft text-sm text-stone-700 font-sans animate-fade-in relative">
                           <div className="flex justify-between items-center mb-2">
                              <h4 className="font-bold flex items-center gap-2 text-primary uppercase tracking-widest text-[10px]"><Sparkles size={12} /> AI Analysis</h4>
                              <button onClick={() => setAnalysisLang(l => l === 'en' ? 'zh' : 'en')} className="text-[10px] font-bold bg-stone-100 px-2 py-1 rounded hover:bg-stone-200 transition-colors">{analysisLang === 'en' ? 'English' : '中文'}</button>
                           </div>
-                          <div className="leading-relaxed prose prose-sm prose-violet max-w-none"><ReactMarkdown>{(analyses[idx] as any)[analysisLang] || "No analysis available."}</ReactMarkdown></div>
+                          <div className="leading-relaxed prose prose-sm prose-violet max-w-none"><ReactMarkdown>{(analyses[idx] as any)?.[analysisLang] || "Generating analysis..."}</ReactMarkdown></div>
+                       </div>
+                    )}
+                    
+                    {/* 3. Recording Panel */}
+                    {activeTool === 'recording' && (
+                       <div className="mt-3 flex flex-col gap-2 animate-fade-in bg-white border border-stone-100 p-3 rounded-xl shadow-sm w-full md:w-3/4">
+                          {/* Recording Controls */}
+                          {(!segmentRecordings[idx] || recordingSegmentIndex === idx) ? (
+                              <div className="flex items-center gap-3">
+                                  <button onClick={() => recordingSegmentIndex === idx ? stopRecording() : startRecording(idx)} className={`w-8 h-8 rounded-full flex items-center justify-center transition-all ${recordingSegmentIndex === idx ? 'bg-red-500 animate-pulse text-white' : 'bg-stone-100 text-stone-500 hover:bg-accent hover:text-white'}`}>
+                                      {recordingSegmentIndex === idx ? <Square size={12} fill="currentColor"/> : <Mic size={14}/>}
+                                  </button>
+                                  <span className="text-xs text-stone-400 font-medium">{recordingSegmentIndex === idx ? "Recording..." : "Tap to record"}</span>
+                              </div>
+                          ) : (
+                              // Playback Controls
+                              <div className="flex flex-col gap-2">
+                                  <div className="flex items-center gap-2">
+                                    <div className="w-6 h-6 rounded-full bg-accent/10 flex items-center justify-center text-accent font-bold text-[8px]">ME</div>
+                                    <audio controls src={segmentRecordings[idx].url} className="h-6 flex-1" />
+                                    <button onClick={() => setSegmentRecordings(prev => { const n = {...prev}; delete n[idx]; return n; })} className="text-stone-400 hover:text-accent p-0.5"><X size={14} /></button>
+                                  </div>
+                                  {!evaluations[idx] ? (
+                                    <button onClick={() => handleEvaluateSegment(idx, segment.en)} disabled={isEvaluating[idx]} className="w-full py-1.5 bg-stone-50 hover:bg-primary/5 text-stone-600 hover:text-primary text-xs font-bold rounded-lg border border-stone-200 hover:border-primary/20 transition-all flex items-center justify-center gap-1">
+                                        {isEvaluating[idx] ? <Loader2 size={12} className="animate-spin"/> : <Stethoscope size={12} />} Analyze Pronunciation
+                                    </button>
+                                  ) : (
+                                    <div className="bg-stone-50 rounded-lg p-3 text-sm animate-fade-in">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <span className={`text-xs font-bold uppercase ${evaluations[idx].score >= 80 ? 'text-emerald-600' : 'text-orange-500'}`}>Score: {evaluations[idx].score}</span>
+                                            <button onClick={() => setEvaluations(prev => { const n = {...prev}; delete n[idx]; return n; })} className="text-[10px] text-stone-400 underline">Clear</button>
+                                        </div>
+                                        <div className="font-serif leading-relaxed mb-2 text-stone-700" dangerouslySetInnerHTML={{ __html: evaluations[idx].diffHtml }} />
+                                        <div className="flex items-start gap-1.5 text-xs text-stone-500 bg-white p-2 rounded border border-stone-100">
+                                            <AlertCircle size={12} className="mt-0.5 flex-shrink-0 text-primary" /> {evaluations[idx].feedback}
+                                        </div>
+                                    </div>
+                                  )}
+                              </div>
+                          )}
                        </div>
                     )}
                   </div>

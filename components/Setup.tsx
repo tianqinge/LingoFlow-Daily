@@ -78,11 +78,6 @@ export const Setup: React.FC<SetupProps> = ({ onComplete }) => {
                     );
                   })}
                 </div>
-                <div className="mt-4 p-3 bg-accent/5 rounded-xl border border-accent/10">
-                    <p className="text-[10px] text-stone-500 leading-relaxed">
-                        <span className="font-bold text-accent">Tip:</span> Choose a level that feels slightly challenging but mostly understandable.
-                    </p>
-                </div>
              </div>
           </div>
 

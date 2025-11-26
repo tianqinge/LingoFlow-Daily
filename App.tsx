@@ -6,7 +6,7 @@ import { ArticleView } from './components/ArticleView';
 import { ToastContainer, ToastData, ToastType, useToastAutoDismiss } from './components/Toast';
 import { UserPreferences, Article, VocabularyItem, ArticleStatus } from './types';
 import { generateDailyArticle, lookupVocabulary } from './services/geminiService';
-import { Menu, Loader2, BookOpen, X } from 'lucide-react';
+import { Menu, Loader2, BookOpen, X, AlertCircle } from 'lucide-react';
 
 const STORAGE_KEY_PREFS = 'lingoflow_prefs';
 const STORAGE_KEY_HISTORY = 'lingoflow_history';
@@ -23,6 +23,7 @@ const App: React.FC = () => {
   
   // Navigation State
   const [showSetup, setShowSetup] = useState(false);
+  const [showHomeConfirm, setShowHomeConfirm] = useState(false); // New state for confirmation modal
   
   // Data Loaded Flag
   const [isDataLoaded, setIsDataLoaded] = useState(false);
@@ -196,8 +197,14 @@ const App: React.FC = () => {
       return prefs.checkInHistory.includes(today);
   };
   
-  const handleReturnHome = () => {
-      // Go back to Setup screen to allow re-selection
+  // Trigger the confirmation modal
+  const handleReturnHomeRequest = () => {
+      setShowHomeConfirm(true);
+  };
+
+  // Actually go home
+  const confirmReturnHome = () => {
+      setShowHomeConfirm(false);
       setCurrentArticle(null);
       setShowSetup(true);
       setShowLeftSidebar(false);
@@ -218,7 +225,11 @@ const App: React.FC = () => {
               <button onClick={() => setShowLeftSidebar(true)} className="p-2 text-stone-500 hover:bg-white/50 rounded-full transition-colors">
                 <Menu size={24} />
               </button>
-              <div className="flex items-center gap-2 text-primary font-serif font-bold text-lg select-none cursor-pointer" onDoubleClick={handleReturnHome} title="Double tap to go Home">
+              <div 
+                className="flex items-center gap-2 text-primary font-serif font-bold text-lg select-none cursor-pointer" 
+                onDoubleClick={handleReturnHomeRequest} 
+                title="Double tap to go Home"
+              >
                 <BookOpen size={20} className="text-primary" />
                 <span>LingoFlow</span>
               </div>
@@ -233,7 +244,14 @@ const App: React.FC = () => {
             <div className="md:hidden absolute right-2 top-2 z-50">
                <button onClick={() => setShowLeftSidebar(false)} className="p-2 text-stone-400"><X size={20}/></button>
             </div>
-            <SidebarLeft history={history} checkInHistory={prefs.checkInHistory} onSelectArticle={(a) => { setCurrentArticle(a); setShowLeftSidebar(false); }} currentArticleId={currentArticle?.id} onReturnHome={handleReturnHome}/>
+            {/* Pass the request handler, not the direct action */}
+            <SidebarLeft 
+                history={history} 
+                checkInHistory={prefs.checkInHistory} 
+                onSelectArticle={(a) => { setCurrentArticle(a); setShowLeftSidebar(false); }} 
+                currentArticleId={currentArticle?.id} 
+                onReturnHome={handleReturnHomeRequest} 
+            />
           </div>
 
           {/* Main Content */}
@@ -268,6 +286,35 @@ const App: React.FC = () => {
 
           {(showLeftSidebar || showRightSidebar) && (
             <div className="fixed inset-0 bg-stone-900/10 backdrop-blur-sm z-30 md:hidden animate-fade-in" onClick={() => { setShowLeftSidebar(false); setShowRightSidebar(false); }}></div>
+          )}
+          
+          {/* Home Confirmation Modal */}
+          {showHomeConfirm && (
+             <div className="fixed inset-0 z-[60] flex items-center justify-center bg-stone-900/20 backdrop-blur-sm animate-fade-in p-4">
+                 <div className="bg-white/95 backdrop-blur-xl p-6 md:p-8 rounded-3xl shadow-2xl border border-white/60 max-w-sm w-full text-center animate-scale-in">
+                     <div className="w-12 h-12 rounded-full bg-primary/10 text-primary flex items-center justify-center mx-auto mb-4">
+                         <AlertCircle size={24} />
+                     </div>
+                     <h3 className="text-xl font-serif font-bold text-stone-800 mb-2">Return to Homepage?</h3>
+                     <p className="text-sm text-stone-500 mb-8 leading-relaxed">
+                         Do you want to select a new article? Your current article is saved in history.
+                     </p>
+                     <div className="flex gap-3">
+                         <button 
+                             onClick={() => setShowHomeConfirm(false)}
+                             className="flex-1 py-3.5 rounded-xl font-bold text-stone-600 bg-stone-100 hover:bg-stone-200 transition-colors active:scale-95"
+                         >
+                             No, Stay
+                         </button>
+                         <button 
+                             onClick={confirmReturnHome}
+                             className="flex-1 py-3.5 rounded-xl font-bold text-white bg-stone-900 hover:bg-primary transition-all shadow-lg shadow-stone-200 hover:shadow-primary/30 active:scale-95"
+                         >
+                             Yes, Return
+                         </button>
+                     </div>
+                 </div>
+             </div>
           )}
         </div>
       );

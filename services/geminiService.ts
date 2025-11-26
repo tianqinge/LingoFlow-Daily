@@ -2,20 +2,52 @@
 import { GoogleGenAI, Modality, Type } from "@google/genai";
 import { CEFRLevel, Article, ArticleSegment, DictationCorrection, RecitationFeedback, SpeakingEvaluation } from '../types';
 import { decodeBase64, decodeAudioData } from './audioUtils';
+import { getCachedAudio, cacheAudio, hashText } from './storageService';
+
+// Helper to safely get the API Key
+const getApiKey = () => {
+  // Check standard process.env (Vite/Webpack usually replace this)
+  const key = process.env.API_KEY; 
+  if (!key || key.includes("YOUR_API_KEY")) {
+    console.error("Gemini API Key is missing or invalid.");
+    return "";
+  }
+  return key;
+};
 
 // Initialize the Gemini Client
-// API Key must be provided via process.env.API_KEY in the build environment
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// We use a lazy initialization pattern or strict checking to prevent crash on load if key is missing.
+const apiKey = getApiKey();
+if (!apiKey) {
+    console.warn("API Key is missing. AI features will fail.");
+}
+
+const ai = new GoogleGenAI({ apiKey: apiKey });
 
 const ARTICLE_MODEL = 'gemini-2.5-flash';
 const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 const STORY_MODEL = 'gemini-2.5-flash';
 const AUDIO_MODEL = 'gemini-2.5-flash'; // For analyzing audio input
 
+// Helper to handle API errors specifically for mobile diagnosis
+const handleApiError = (error: any, context: string) => {
+    console.error(`Error in ${context}:`, error);
+    const msg = error?.message || String(error);
+    if (msg.includes("API key not valid") || msg.includes("failed to list models") || msg.includes("403")) {
+        throw new Error("API configuration error. Please check your API Key settings.");
+    }
+    if (msg.includes("fetch failed") || msg.includes("NetworkError")) {
+        throw new Error("Network error. Please check your internet connection.");
+    }
+    throw error;
+};
+
 /**
  * Generates a daily news article based on topic and level.
  */
 export const generateDailyArticle = async (topic: string, level: CEFRLevel, dateStr: string): Promise<Article> => {
+  if (!apiKey) throw new Error("API Key not configured.");
+  
   const prompt = `
     You are an expert journalist and English teacher.
     Write a news article or report about "${topic}" suitable for CEFR Level ${level}.
@@ -38,108 +70,140 @@ export const generateDailyArticle = async (topic: string, level: CEFRLevel, date
     }
   `;
 
-  const response = await ai.models.generateContent({
-    model: ARTICLE_MODEL,
-    contents: prompt,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          source: { type: Type.STRING },
-          summary: { type: Type.STRING },
-          segments: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                en: { type: Type.STRING },
-                zh: { type: Type.STRING }
-              },
-              required: ["en", "zh"]
-            }
+  try {
+      const response = await ai.models.generateContent({
+        model: ARTICLE_MODEL,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              source: { type: Type.STRING },
+              summary: { type: Type.STRING },
+              segments: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    en: { type: Type.STRING },
+                    zh: { type: Type.STRING }
+                  },
+                  required: ["en", "zh"]
+                }
+              }
+            },
+            required: ["title", "source", "summary", "segments"]
           }
-        },
-        required: ["title", "source", "summary", "segments"]
-      }
-    }
-  });
+        }
+      });
 
-  const text = response.text;
-  if (!text) throw new Error("No content generated");
+      const text = response.text;
+      if (!text) throw new Error("No content generated");
 
-  const data = JSON.parse(text);
+      const data = JSON.parse(text);
 
-  return {
-    id: Date.now().toString(),
-    date: dateStr,
-    topic,
-    level,
-    title: data.title,
-    content: data.segments, // Store as array of segments
-    summary: data.summary,
-    source: data.source || "LingoFlow AI News",
-    status: 'reading' // Initialize status
-  };
+      return {
+        id: Date.now().toString(),
+        date: dateStr,
+        topic,
+        level,
+        title: data.title,
+        content: data.segments, // Store as array of segments
+        summary: data.summary,
+        source: data.source || "LingoFlow AI News",
+        status: 'reading' // Initialize status
+      };
+  } catch (error) {
+      handleApiError(error, "generateDailyArticle");
+      throw error; // unreachable but satisfies ts
+  }
 };
 
 /**
- * Generates audio for the given text using Gemini TTS.
+ * Generates audio for the given text using Gemini TTS with Caching.
  */
 export const generateSpeech = async (text: string): Promise<AudioBuffer> => {
-  const response = await ai.models.generateContent({
-    model: TTS_MODEL,
-    contents: [{ parts: [{ text }] }],
-    config: {
-      responseModalities: [Modality.AUDIO],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: 'Fenrir' }, 
-        },
-      },
-    },
-  });
-
-  const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-  if (!base64Audio) {
-    throw new Error("No audio data returned");
-  }
-
+  if (!apiKey) throw new Error("API Key not configured.");
   const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-  const audioBuffer = await decodeAudioData(
-    decodeBase64(base64Audio),
-    audioContext,
-    24000,
-    1
-  );
+  const cacheKey = hashText(text);
 
-  return audioBuffer;
+  try {
+      // 1. Try Cache First
+      const cachedData = await getCachedAudio(cacheKey);
+      if (cachedData) {
+          // console.log("Audio cache hit");
+          return await decodeAudioData(new Uint8Array(cachedData), audioContext, 24000, 1);
+      }
+
+      // 2. Fetch from API if miss
+      const response = await ai.models.generateContent({
+        model: TTS_MODEL,
+        contents: [{ parts: [{ text }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Fenrir' }, 
+            },
+          },
+        },
+      });
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!base64Audio) {
+        throw new Error("No audio data returned");
+      }
+
+      const audioBytes = decodeBase64(base64Audio);
+      
+      // 3. Save to Cache (in background)
+      cacheAudio(cacheKey, audioBytes.buffer);
+
+      // 4. Decode and return
+      return await decodeAudioData(
+        audioBytes,
+        audioContext,
+        24000,
+        1
+      );
+  } catch (error) {
+      handleApiError(error, "generateSpeech");
+      throw error;
+  }
 };
 
 /**
  * Generates a short story using a list of vocabulary words.
  */
 export const generateVocabularyStory = async (words: string[]): Promise<string> => {
-  const wordList = words.join(", ");
-  const prompt = `
-    Create a short, creative, and coherent story (approx 150-200 words) that incorporates the following vocabulary words: ${wordList}.
-    Highlight the used words in the text by wrapping them in **bold markdown**.
-    The story should help a learner understand the context of these words.
-  `;
+  if (!apiKey) throw new Error("API Key not configured.");
+  try {
+      const wordList = words.join(", ");
+      const prompt = `
+        Create a short, creative, and coherent story (approx 150-200 words) that incorporates the following vocabulary words: ${wordList}.
+        Highlight the used words in the text by wrapping them in **bold markdown**.
+        The story should help a learner understand the context of these words.
+      `;
 
-  const response = await ai.models.generateContent({
-    model: STORY_MODEL,
-    contents: prompt,
-  });
+      const response = await ai.models.generateContent({
+        model: STORY_MODEL,
+        contents: prompt,
+      });
 
-  return response.text || "Could not generate story.";
+      return response.text || "Could not generate story.";
+  } catch (error) {
+      handleApiError(error, "generateVocabularyStory");
+      throw error;
+  }
 };
 
 /**
  * Analyzes a specific text segment for grammar and vocabulary breakdown.
  */
 export const analyzeSegment = async (text: string): Promise<string> => {
+  if (!apiKey) throw new Error("API Key not configured.");
   const prompt = `
     Analyze the following English text for an ESL learner:
     "${text}"
@@ -174,6 +238,7 @@ export const analyzeSegment = async (text: string): Promise<string> => {
  * Look up vocabulary definition and phonetic.
  */
 export const lookupVocabulary = async (word: string, context: string): Promise<{ definition: string, phonetic: string }> => {
+  if (!apiKey) throw new Error("API Key not configured.");
   const prompt = `
     Provide a concise definition in Simplified Chinese and IPA phonetic transcription for the word "${word}"${context ? ` as used in this context: "${context}"` : ''}.
     
@@ -211,6 +276,7 @@ export const lookupVocabulary = async (word: string, context: string): Promise<{
  * Checks the user's dictation against the original text.
  */
 export const checkDictation = async (original: string, userInput: string): Promise<DictationCorrection> => {
+  if (!apiKey) throw new Error("API Key not configured.");
   const prompt = `
     Compare the User Input with the Original Text. 
     1. Identify missing words, wrong words, and extra words.
@@ -268,6 +334,7 @@ export const checkDictation = async (original: string, userInput: string): Promi
  * Evaluates the user's recitation audio against the reference text.
  */
 export const evaluateRecitation = async (audioBase64: string, mimeType: string, referenceText: string): Promise<RecitationFeedback> => {
+  if (!apiKey) throw new Error("API Key not configured.");
   const prompt = `
     Listen to this audio recording of a student reading the following text:
     "${referenceText}"
@@ -323,6 +390,7 @@ export const evaluateRecitation = async (audioBase64: string, mimeType: string, 
  * Evaluates a specific speaking segment.
  */
 export const evaluateSpeakingSegment = async (audioBase64: string, mimeType: string, referenceText: string): Promise<SpeakingEvaluation> => {
+  if (!apiKey) throw new Error("API Key not configured.");
   const prompt = `
     You are evaluating a student's pronunciation of a single sentence.
     Reference Text: "${referenceText}"
